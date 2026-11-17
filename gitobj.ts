@@ -352,16 +352,114 @@ async function inflateOne(buf: Buffer, start: number): Promise<{ data: Buffer; c
   });
 }
 
+/** Adler-32 of `data` (the checksum a zlib stream ends with), as 4 big-endian bytes. */
+function adler32Bytes(data: Buffer): Buffer {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + data[i]!) % 65521;
+    b = (b + a) % 65521;
+  }
+  const out = Buffer.alloc(4);
+  out.writeUInt32BE(((b << 16) | a) >>> 0, 0);
+  return out;
+}
+
+/**
+ * The length of the zlib stream at `start`, found by its adler-32 trailer instead
+ * of re-deflating: the trailer is the checksum of the inflated data, so it is
+ * known before the search starts. Returns -1 when the stream cannot be located
+ * with confidence (the caller falls back to the re-deflate path). `isLast` means
+ * the stream runs to `end` (the pack trailer), so no search is needed.
+ */
+function zlibLength(data: Buffer, rest: Buffer, start: number, end: number, isLast: boolean): number {
+  if (isLast) {
+    const length = end - start;
+    if (length < 6) return -1; // a zlib stream is at least 2 header + 4 adler bytes
+    if (!rest.subarray(length - 4, length).equals(adler32Bytes(data))) return -1;
+    return length;
+  }
+  const trailer = adler32Bytes(data);
+  let searchFrom = 2; // the adler-32 cannot start inside the 2-byte zlib header
+  for (;;) {
+    const found = rest.indexOf(trailer, searchFrom);
+    if (found < 0) return -1;
+    const candidate = found + 4;
+    if (start + candidate >= end) return -1;
+    // The byte after the trailer must start a plausible next object header.
+    const next = rest[candidate]!;
+    const typeCode = (next >> 4) & 0x07;
+    if (typeCode === 1 || typeCode === 2 || typeCode === 3 || typeCode === 4 || typeCode === 6 || typeCode === 7) {
+      return candidate;
+    }
+    searchFrom = found + 1;
+  }
+}
+
 export interface ReadPackResult {
   objects: Map<string, GitObject>;
   deltaCount: number;
 }
 
 /**
+ * The fast pack reader: synchronous, full objects only, lengths via adler-32.
+ * Returns null on any doubt (a delta, a length it cannot verify, a short pack):
+ * the caller then uses the complete async reader below.
+ */
+function readPackFast(pack: Buffer): ReadPackResult | null {
+  if (pack.length < 12 || pack.subarray(0, 4).toString('ascii') !== 'PACK') return null;
+  const version = pack.readUInt32BE(4);
+  if (version !== 2 && version !== 3) return null;
+  const count = pack.readUInt32BE(8);
+  const objects = new Map<string, GitObject>();
+  const end = pack.length - 20;
+  let offset = 12;
+  for (let index = 0; index < count; index += 1) {
+    if (offset >= end) return null;
+    let byte = pack[offset++]!;
+    const typeCode = (byte >> 4) & 0x07;
+    let size = byte & 0x0f;
+    let shift = 4;
+    while (byte & 0x80) {
+      if (offset >= end) return null;
+      byte = pack[offset++]!;
+      size |= (byte & 0x7f) << shift;
+      shift += 7;
+    }
+    const type = PACK_TO_TYPE[typeCode];
+    if (type === undefined) return null; // a delta (or unknown type): use the slow path
+    const rest = pack.subarray(offset, end);
+    let data: Buffer;
+    try {
+      data = inflateSync(rest);
+    } catch {
+      return null;
+    }
+    if (data.length !== size) return null;
+    const consumed = zlibLength(data, rest, offset, end, index === count - 1);
+    if (consumed < 0) return null;
+    offset += consumed;
+    const oid = hashObject(type, data);
+    objects.set(oid, { type, data });
+  }
+  if (offset !== end) return null;
+  return { objects, deltaCount: 0 };
+}
+
+/**
  * Read a packfile (version 2), resolving OFS_DELTA and REF_DELTA against objects in
  * the pack and, for REF_DELTA, against `resolveBase` (the store's objects).
+ * The fast synchronous path handles the common case (full objects only); anything
+ * it cannot verify falls back to the complete reader below.
  */
 export async function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject | undefined): Promise<ReadPackResult> {
+  const fast = readPackFast(pack);
+  if (fast !== null) return fast;
+  return readPackSlow(pack, resolveBase);
+}
+
+/** The complete pack reader: deltas included, lengths via re-deflate (or a stream). */
+async function readPackSlow(pack: Buffer, resolveBase?: (oid: string) => GitObject | undefined): Promise<ReadPackResult> {
   if (pack.length < 12 || pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('not a packfile');
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
