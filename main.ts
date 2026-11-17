@@ -1,20 +1,23 @@
-// The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// How this process talks to the harness env (see env/src/wire.ts for the authoritative wire shape):
+// bind some ephemeral port, hand that port to the env, then keep asking the env whether the trial is
+// finished and leave with exit 0 once it says so. This file stays deliberately small — the scored
+// behavior lives in the server app.ts builds, while the lifecycle itself belongs to the harness.
 //
-//   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
-//      there is nothing to talk to, so the program exits 1 at once.
-//   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
-//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
-//      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
-//      entry already registered, and this process keeps waiting like any other.
-//   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
-//      false} while the suite runs), so this is a poll, not a long-held request. A failed or slow poll
-//      is retried with a short exponential backoff; the process never exits before the env says done.
-//   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
-//      reads.
+//   1. MAKEFUN_ENV_URL points at the env (http://store:8080 inside a trial container). With no
+//      env URL set there is no one to register with, so the process exits 1 immediately.
+//   2. Create the server and listen(0), letting the kernel hand out a free port. Port 8080 is the
+//      env's own — never bind it.
+//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env remembers the caller's address together
+//      with N as this entry's base URL and starts dialing it. Only the first register wins; a 409
+//      says some other entry got there first, and this process just keeps waiting like anyone else.
+//   4. GET $MAKEFUN_ENV_URL/done until the body reads {"done": true}. The env replies at once
+//      ({"done": false} while the suite is still running), so this is a poll loop, not a held-open
+//      request. A failed or slow poll is retried after a short exponential backoff; the process
+//      never exits until the env reports done.
+//   5. Close the server and exit 0. The harness then tears the env down, which writes the export
+//      the scorer reads.
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+// main.ts imports only its own server: no package, no Node built-in, no model call.
 
 import { createApp } from './app.ts';
 
@@ -23,6 +26,10 @@ if (ENV_URL === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
   process.exit(1);
 }
+
+/** Paths on the env origin used by the lifecycle: register the port, then poll for done. */
+const REGISTER_PATH = '/register';
+const DONE_PATH = '/done';
 
 /** How long one register or done request may take before it is abandoned and retried. */
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -38,6 +45,17 @@ function retryDelay(attempt: number): number {
 }
 
 /**
+ * Sort a register response into what the caller should do with it: 'ok' accepts and moves on (200 is
+ * the normal answer, 409 means the first register already won), 'fatal' is a contract error that ends
+ * the program, and anything else is worth retrying because the env may still be starting.
+ */
+function classifyRegisterStatus(status: number): 'ok' | 'fatal' | 'retry' {
+  if (status === 200 || status === 409) return 'ok';
+  if (status === 400 || status === 405) return 'fatal';
+  return 'retry';
+}
+
+/**
  * POST the bound port until the env accepts it. 200 is the normal answer; 409 means a first register
  * already won, which is not this process's to fix. 400 and 405 are contract errors and end the program;
  * a network error or another status is retried, since the env may still be starting.
@@ -45,14 +63,15 @@ function retryDelay(attempt: number): number {
 async function register(port: number): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      const res = await fetch(`${ENV_URL}/register`, {
+      const res = await fetch(`${ENV_URL}${REGISTER_PATH}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ port }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
+      const outcome = classifyRegisterStatus(res.status);
+      if (outcome === 'ok') return;
+      if (outcome === 'fatal') throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
     }
@@ -64,7 +83,7 @@ async function register(port: number): Promise<void> {
 async function waitForDone(): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      const res = await fetch(`${ENV_URL}${DONE_PATH}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
       if (res.ok) {
         const body = (await res.json()) as { done?: unknown };
         if (body.done === true) return;
