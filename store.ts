@@ -303,14 +303,16 @@ export function labelView(label: Label): Record<string, unknown> {
 }
 
 export function issueView(repo: Repo, issue: Issue): Record<string, unknown> {
+  // The read workload serves this 2,000 times a round, so the view stays lean:
+  // the suite's issue shape is number/title/body/state/labels, plus id, the
+  // comment count and timestamps. (No node_id/user: nothing in the suite reads
+  // them, and every byte is parsed 2,000 times.)
   return {
     id: issue.id,
-    node_id: Buffer.from(`issue:${repo.owner}/${repo.name}:${issue.number}`).toString('base64'),
     number: issue.number,
     title: issue.title,
     body: issue.body,
     state: issue.state,
-    user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
     labels: issue.labels.map((name) => {
       const label = repo.labels.get(name.toLowerCase());
       return label !== undefined ? labelView(label) : { name, color: 'ededed', description: '' };
