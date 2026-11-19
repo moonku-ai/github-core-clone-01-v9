@@ -24,6 +24,7 @@ import {
   isOid,
   parseTag,
   peelToNonTag,
+  pktLengthAt,
   pktLine,
   readPack,
   sidebandPackets,
@@ -126,13 +127,26 @@ interface FetchRequest {
   depth: number | undefined;
 }
 
-function parseFetchArgs(lines: string[]): FetchRequest {
+/** Drop one trailing newline (what `replace(/\n$/, '')` did, without the regex). */
+function stripNewline(line: string): string {
+  return line.endsWith('\n') ? line.slice(0, -1) : line;
+}
+
+/**
+ * The fetch cache key, built by hand instead of JSON.stringify: the request's
+ * oids are 40 lowercase-hex chars, so ',' and '|' separators cannot collide.
+ */
+function fetchCacheKey(prefix: string, version: number, request: FetchRequest): string {
+  return `${prefix}:${version}:${request.wants.join(',')}|${request.haves.join(',')}|${request.shallow.join(',')}|${request.depth ?? ''}`;
+}
+
+function parseFetchArgs(lines: string[], start = 0): FetchRequest {
   const wants: string[] = [];
   const haves: string[] = [];
   const shallow: string[] = [];
   let depth: number | undefined;
-  for (const line of lines) {
-    const text = line.replace(/\n$/, '');
+  for (let i = start; i < lines.length; i += 1) {
+    const text = stripNewline(lines[i]!);
     if (text.startsWith('want ')) {
       const oid = text.slice(5, 45);
       if (isOid(oid)) wants.push(oid);
@@ -168,7 +182,7 @@ function computeFetch(repo: Repo, request: FetchRequest): { closure: FetchClosur
 }
 
 function v2FetchResponse(repo: Repo, request: FetchRequest): Buffer {
-  const cacheKey = `fetch2:${repo.version}:${JSON.stringify(request)}`;
+  const cacheKey = fetchCacheKey('fetch2', repo.version, request);
   const cached = repo.gitCache.get(cacheKey);
   if (cached !== undefined) return cached;
   const { closure, pack } = computeFetch(repo, request);
@@ -188,7 +202,7 @@ function v2FetchResponse(repo: Repo, request: FetchRequest): Buffer {
 }
 
 function v0FetchResponse(repo: Repo, request: FetchRequest): Buffer {
-  const cacheKey = `fetch0:${repo.version}:${JSON.stringify(request)}`;
+  const cacheKey = fetchCacheKey('fetch0', repo.version, request);
   const cached = repo.gitCache.get(cacheKey);
   if (cached !== undefined) return cached;
   const { closure, pack } = computeFetch(repo, request);
@@ -240,14 +254,14 @@ export function uploadPack(store: Store, owner: string, name: string, body: Buff
     if (packet.kind === 'data') lines.push(packet.payload.toString('utf8'));
   }
   if (lines.length === 0) return { status: 400, contentType: 'text/plain', body: Buffer.from('empty upload-pack request', 'utf8') };
-  const first = lines[0]!.replace(/\n$/, '');
+  const first = stripNewline(lines[0]!);
   try {
     if (first.startsWith('command=ls-refs')) {
       let peel = false;
       let symrefs = false;
       const prefixes: string[] = [];
-      for (const line of lines.slice(1)) {
-        const text = line.replace(/\n$/, '');
+      for (let i = 1; i < lines.length; i += 1) {
+        const text = stripNewline(lines[i]!);
         if (text === 'peel') peel = true;
         else if (text === 'symrefs') symrefs = true;
         else if (text.startsWith('ref-prefix ')) prefixes.push(text.slice('ref-prefix '.length));
@@ -255,7 +269,7 @@ export function uploadPack(store: Store, owner: string, name: string, body: Buff
       return { status: 200, contentType: UPLOAD_RESULT_CONTENT_TYPE, body: lsRefsResponse(repo, peel, symrefs, prefixes) };
     }
     if (first.startsWith('command=fetch')) {
-      const request = parseFetchArgs(lines.slice(1));
+      const request = parseFetchArgs(lines, 1);
       return { status: 200, contentType: UPLOAD_RESULT_CONTENT_TYPE, body: v2FetchResponse(repo, request) };
     }
     if (first.startsWith('command=')) {
@@ -288,9 +302,8 @@ export async function receivePack(store: Store, owner: string, name: string, bod
   try {
     while (offset < body.length) {
       if (offset + 4 > body.length) throw new Error('truncated pkt-line');
-      const hex = body.subarray(offset, offset + 4).toString('ascii');
-      if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error('bad pkt-line length');
-      const len = parseInt(hex, 16);
+      const len = pktLengthAt(body, offset);
+      if (len < 0) throw new Error('bad pkt-line length');
       if (len === 0) {
         packStart = offset + 4;
         break;
@@ -305,7 +318,7 @@ export async function receivePack(store: Store, owner: string, name: string, bod
   if (packStart < 0) return { status: 400, contentType: 'text/plain', body: Buffer.from('receive-pack request has no command flush', 'utf8') };
   const commands: PushCommand[] = [];
   for (const raw of commandLines) {
-    const line = raw.replace(/\n$/, '');
+    const line = stripNewline(raw);
     const nul = line.indexOf('\0');
     const text = nul >= 0 ? line.slice(0, nul) : line;
     const parts = text.split(' ');
