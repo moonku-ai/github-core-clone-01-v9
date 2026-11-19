@@ -21,15 +21,28 @@ import { Store } from './store.ts';
 const JSON_TYPE = 'application/json; charset=utf-8';
 /** The largest request body accepted (packs stay far below this). */
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
+/** A shared empty query set for requests without a query string (never mutated). */
+const EMPTY_QUERY = new URLSearchParams();
 
 let requestCounter = 0;
 
 function nextRequestId(): string {
   requestCounter += 1;
-  return `req-${requestCounter.toString(16)}-${Date.now().toString(16)}`;
+  return `req-${requestCounter.toString(16)}`;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
+  if (Buffer.isBuffer(body)) {
+    // A cached serialization: send the bytes verbatim, no re-encode.
+    res.writeHead(status, {
+      'content-type': JSON_TYPE,
+      'content-length': body.length,
+      'x-github-request-id': nextRequestId(),
+      ...extraHeaders,
+    });
+    res.end(body);
+    return;
+  }
   const text = typeof body === 'string' ? body : JSON.stringify(body);
   res.writeHead(status, {
     'content-type': JSON_TYPE,
@@ -54,9 +67,11 @@ function notFound(res: ServerResponse): void {
   sendJson(res, 404, { message: 'Not Found' });
 }
 
-/** The bearer token the suite presents, when the trial sets one. */
+/** The bearer token the suite presents, when the trial sets one. Read once: the trial sets it at process start and never changes it. */
+let cachedToken: string | null = null;
 function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  if (cachedToken === null) cachedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return cachedToken;
 }
 
 /** True when the request carries the suite's bearer token (any non-empty one when unset). */
@@ -89,11 +104,60 @@ function readBody(req: IncomingMessage): Promise<Buffer | null> {
 }
 
 function decodeSegment(segment: string): string | null {
+  if (segment.indexOf('%') < 0) return segment; // nothing to decode
   try {
     return decodeURIComponent(segment);
   } catch {
     return null;
   }
+}
+
+/**
+ * Match a git smart-HTTP path `/{owner}/{repo}.git/<service>` by hand (what the
+ * old route regex did, without the regex): the service is one of the three known
+ * suffixes, the head is `/{owner}/{repo}.git`, and neither name may be empty or
+ * contain a slash.
+ */
+function matchGitRoute(path: string): { owner: string; repo: string; service: string } | null {
+  let service: string;
+  let head: string;
+  if (path.endsWith('/info/refs')) {
+    service = 'info/refs';
+    head = path.slice(0, -10);
+  } else if (path.endsWith('/git-upload-pack')) {
+    service = 'git-upload-pack';
+    head = path.slice(0, -16);
+  } else if (path.endsWith('/git-receive-pack')) {
+    service = 'git-receive-pack';
+    head = path.slice(0, -17);
+  } else {
+    return null;
+  }
+  if (!head.endsWith('.git')) return null;
+  const slash = head.indexOf('/', 1);
+  if (slash < 0) return null;
+  const owner = head.slice(1, slash);
+  const repo = head.slice(slash + 1, head.length - 4);
+  if (owner === '' || repo === '' || repo.includes('/')) return null;
+  return { owner, repo, service };
+}
+
+/** One query parameter's value from a raw query string, or null when absent. */
+function queryParam(queryString: string, name: string): string | null {
+  if (queryString === '') return null;
+  const parts = queryString.split('&');
+  for (const part of parts) {
+    if (!part.startsWith(name)) continue;
+    if (part.length === name.length) return '';
+    if (part[name.length] !== '=') continue;
+    const raw = part.slice(name.length + 1).replaceAll('+', ' ');
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 export function createApp(): Server {
@@ -116,14 +180,12 @@ export function createApp(): Server {
 
 async function handleRequest(store: Store, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    notFound(res);
-    return;
-  }
-  const path = url.pathname;
+  // Split the request target by hand instead of `new URL`: the router only needs
+  // the pathname, and the query string only where a parameter is actually read.
+  const rawUrl = req.url ?? '/';
+  const queryAt = rawUrl.indexOf('?');
+  const path = queryAt < 0 ? rawUrl : rawUrl.slice(0, queryAt);
+  const queryString = queryAt < 0 ? '' : rawUrl.slice(queryAt + 1);
 
   // The boot probe: no auth, no body.
   if (method === 'GET' && path === '/healthz') {
@@ -133,11 +195,11 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
 
   // Git smart HTTP: /{owner}/{repo}.git/<service>. No auth: the git client
   // presents its token only to the REST repo-create helper.
-  const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
+  const gitMatch = matchGitRoute(path);
   if (gitMatch !== null) {
-    const owner = decodeSegment(gitMatch[1]!);
-    const repoName = decodeSegment(gitMatch[2]!);
-    const service = gitMatch[3]!;
+    const owner = decodeSegment(gitMatch.owner);
+    const repoName = decodeSegment(gitMatch.repo);
+    const service = gitMatch.service;
     if (owner === null || repoName === null) {
       notFound(res);
       return;
@@ -147,7 +209,7 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
         notFound(res);
         return;
       }
-      const serviceParam = url.searchParams.get('service');
+      const serviceParam = queryParam(queryString, 'service');
       if (serviceParam !== 'git-upload-pack' && serviceParam !== 'git-receive-pack') {
         notFound(res);
         return;
@@ -268,7 +330,12 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
       return;
     }
     const restPath = path.slice('/api/v3'.length);
-    const rawSegments = restPath.split('/').filter((segment) => segment !== '');
+    // The leading slash is the only empty piece for a clean path; filter only
+    // when the path has a double slash or a trailing slash.
+    let rawSegments = restPath === '' ? [] : restPath.slice(1).split('/');
+    if (restPath.includes('//') || restPath.endsWith('/')) {
+      rawSegments = rawSegments.filter((segment) => segment !== '');
+    }
     const segments: string[] = [];
     for (const segment of rawSegments) {
       const decoded = decodeSegment(segment);
@@ -298,7 +365,7 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
       store,
       method,
       segments,
-      query: url.searchParams,
+      query: queryString === '' ? EMPTY_QUERY : new URLSearchParams(queryString),
       body,
       bodyError,
       host: req.headers.host ?? '127.0.0.1',

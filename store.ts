@@ -95,7 +95,7 @@ export class Repo {
   /** Bumped on any ref or object mutation; git caches key on it. */
   version = 0;
   /** Serialized GET-issue bodies, for the read workload. Invalidated on mutation. */
-  readonly issueJsonCache = new Map<number, string>();
+  readonly issueJsonCache = new Map<number, Buffer>();
   /** Cached git responses (advertisements, ls-refs, fetch bodies), keyed by request. */
   readonly gitCache = new Map<string, Buffer>();
 
@@ -240,6 +240,10 @@ export class Store {
   }
 
   getRepo(owner: string, name: string): Repo | undefined {
+    // The common case is already-lowercase names: try the key as-is first and
+    // only pay for the lowercased lookup when the exact key misses.
+    const exact = this.repos.get(`${owner}/${name}`);
+    if (exact !== undefined) return exact;
     return this.repos.get(this.repoKey(owner, name));
   }
 

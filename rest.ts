@@ -48,7 +48,7 @@ export interface RestContext {
 
 export interface RestResponse {
   status: number;
-  /** JSON-serializable body, or null for 204. A string is sent verbatim (cached JSON). */
+  /** JSON-serializable body, or null for 204. A string or Buffer is sent verbatim (cached JSON). */
   body: unknown;
   headers?: Record<string, string>;
 }
@@ -100,14 +100,20 @@ function linkHeader(link: string | null): Record<string, string> | undefined {
 
 /** The repository a route names, or null when the owner is not the viewer or it is missing. */
 function findRepo(ctx: RestContext, owner: string, name: string): Repo | null {
-  if (owner.toLowerCase() !== VIEWER_LOGIN) return null;
+  if (owner !== VIEWER_LOGIN && owner.toLowerCase() !== VIEWER_LOGIN) return null;
   return ctx.store.getRepo(owner, name) ?? null;
 }
 
 function parseNumber(segment: string): number | null {
-  if (!/^\d+$/.test(segment)) return null;
-  const value = Number.parseInt(segment, 10);
-  return Number.isSafeInteger(value) && value > 0 ? value : null;
+  if (segment === '') return null;
+  let value = 0;
+  for (let i = 0; i < segment.length; i += 1) {
+    const digit = segment.charCodeAt(i) - 48;
+    if (digit < 0 || digit > 9) return null;
+    value = value * 10 + digit;
+    if (!Number.isSafeInteger(value)) return null;
+  }
+  return value > 0 ? value : null;
 }
 
 // ---------------------------------------------------------------- contents helpers
@@ -511,12 +517,12 @@ function handleIssues(ctx: RestContext, repo: Repo, rest: string[]): RestRespons
   if (issue === undefined) return err(404, 'Not Found');
   if (rest.length === 1) {
     if (ctx.method === 'GET') {
-      // Hot path (the read workload): serve the cached serialization.
+      // Hot path (the read workload): serve the cached serialization bytes.
       const cached = repo.issueJsonCache.get(number);
       if (cached !== undefined) return { status: 200, body: cached };
-      const text = JSON.stringify(issueView(repo, issue));
-      repo.issueJsonCache.set(number, text);
-      return { status: 200, body: text };
+      const buf = Buffer.from(JSON.stringify(issueView(repo, issue)), 'utf8');
+      repo.issueJsonCache.set(number, buf);
+      return { status: 200, body: buf };
     }
     if (ctx.method === 'PATCH') {
       if (ctx.bodyError) return err(400, 'Problems parsing JSON');
