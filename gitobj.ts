@@ -27,7 +27,14 @@ export function hashObject(type: ObjectType, data: Buffer): string {
 }
 
 export function isOid(value: unknown): value is string {
-  return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value);
+  if (typeof value !== 'string' || value.length !== 40) return false;
+  for (let i = 0; i < 40; i += 1) {
+    const c = value.charCodeAt(i);
+    const digit = c >= 48 && c <= 57;
+    const lowerHex = c >= 97 && c <= 102;
+    if (!digit && !lowerHex) return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------- commits
@@ -170,15 +177,38 @@ export type PktPacket =
   | { kind: 'delim' }
   | { kind: 'end' };
 
+/** One hex digit's value, or -1 when the byte is not a hex digit. */
+function hexValue(byte: number): number {
+  if (byte >= 48 && byte <= 57) return byte - 48;
+  if (byte >= 97 && byte <= 102) return byte - 87;
+  if (byte >= 65 && byte <= 70) return byte - 55;
+  return -1;
+}
+
+/**
+ * The pkt-line length at `offset` (4 hex digits, the length counts itself), or -1
+ * when the prefix is not four hex digits. The caller checks the bounds first.
+ */
+export function pktLengthAt(buf: Buffer, offset: number): number {
+  const d0 = hexValue(buf[offset]!);
+  const d1 = hexValue(buf[offset + 1]!);
+  const d2 = hexValue(buf[offset + 2]!);
+  const d3 = hexValue(buf[offset + 3]!);
+  if (d0 < 0 || d1 < 0 || d2 < 0 || d3 < 0) return -1;
+  return (d0 << 12) | (d1 << 8) | (d2 << 4) | d3;
+}
+
 /** Decode a whole buffer of pkt-lines. Throws on a malformed length prefix. */
 export function decodePktLines(buf: Buffer): PktPacket[] {
   const packets: PktPacket[] = [];
   let offset = 0;
   while (offset < buf.length) {
     if (offset + 4 > buf.length) throw new Error('truncated pkt-line length');
-    const hex = buf.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error(`bad pkt-line length ${JSON.stringify(hex)}`);
-    const len = parseInt(hex, 16);
+    const len = pktLengthAt(buf, offset);
+    if (len < 0) {
+      const hex = buf.subarray(offset, offset + 4).toString('ascii');
+      throw new Error(`bad pkt-line length ${JSON.stringify(hex)}`);
+    }
     if (len === 0) {
       packets.push({ kind: 'flush' });
       offset += 4;
@@ -352,13 +382,24 @@ async function inflateOne(buf: Buffer, start: number): Promise<{ data: Buffer; c
   });
 }
 
-/** Adler-32 of `data` (the checksum a zlib stream ends with), as 4 big-endian bytes. */
+/**
+ * Adler-32 of `data` (the checksum a zlib stream ends with), as 4 big-endian bytes.
+ * The modulo is deferred to the end of each 5552-byte chunk (zlib's NMAX): inside a
+ * chunk the sums stay far below 2^53, so the result is identical to the per-byte
+ * version at a fraction of the cost.
+ */
 function adler32Bytes(data: Buffer): Buffer {
   let a = 1;
   let b = 0;
-  for (let i = 0; i < data.length; i += 1) {
-    a = (a + data[i]!) % 65521;
-    b = (b + a) % 65521;
+  let i = 0;
+  while (i < data.length) {
+    const end = Math.min(data.length, i + 5552);
+    for (; i < end; i += 1) {
+      a += data[i]!;
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
   }
   const out = Buffer.alloc(4);
   out.writeUInt32BE(((b << 16) | a) >>> 0, 0);
@@ -407,7 +448,7 @@ export interface ReadPackResult {
  * the caller then uses the complete async reader below.
  */
 function readPackFast(pack: Buffer): ReadPackResult | null {
-  if (pack.length < 12 || pack.subarray(0, 4).toString('ascii') !== 'PACK') return null;
+  if (pack.length < 12 || pack[0] !== 0x50 || pack[1] !== 0x41 || pack[2] !== 0x43 || pack[3] !== 0x4b) return null;
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) return null;
   const count = pack.readUInt32BE(8);
@@ -460,7 +501,7 @@ export async function readPack(pack: Buffer, resolveBase?: (oid: string) => GitO
 
 /** The complete pack reader: deltas included, lengths via re-deflate (or a stream). */
 async function readPackSlow(pack: Buffer, resolveBase?: (oid: string) => GitObject | undefined): Promise<ReadPackResult> {
-  if (pack.length < 12 || pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('not a packfile');
+  if (pack.length < 12 || pack[0] !== 0x50 || pack[1] !== 0x41 || pack[2] !== 0x43 || pack[3] !== 0x4b) throw new Error('not a packfile');
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const count = pack.readUInt32BE(8);
